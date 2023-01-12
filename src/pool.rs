@@ -1,39 +1,29 @@
-use crate::SERVER_PORT;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
-use std::{
-    collections::HashMap,
-    net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpSocket, TcpStream},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    sync::Mutex,
 };
-use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::{
+    tungstenite::{self, Message},
+    WebSocketStream,
+};
 
 pub struct DummyPool {
-    task_txs: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<String>>>>,
+    task_txs: HashMap<SocketAddr, UnboundedSender<String>>,
+    reply_tx: UnboundedSender<(SocketAddr, String)>,
 }
 
 impl DummyPool {
-    pub async fn new() -> Result<DummyPool, tungstenite::Error> {
-        let task_txs = Arc::new(Mutex::new(HashMap::new()));
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, SERVER_PORT)).await?;
+    pub async fn new(client_address: Vec<SocketAddr>) -> Result<DummyPool, tungstenite::Error> {
+        let task_txs = HashMap::new();
         let (reply_tx, mut reply_rx) = unbounded_channel();
+        let mut pool = DummyPool { task_txs, reply_tx };
 
-        let hash_map = task_txs.clone();
-        tokio::spawn(async move {
-            loop {
-                let (tcp_stream, addr) = listener.accept().await?;
-                let (task_tx, task_rx) = unbounded_channel();
-                hash_map.lock().await.insert(addr, task_tx);
-                tokio::spawn(process(tcp_stream, addr, reply_tx.clone(), task_rx));
-            }
-            #[allow(unreachable_code)]
-            Result::<(), tungstenite::Error>::Ok(())
-        });
+        for addr in client_address {
+            pool.add_node(addr).await?;
+        }
 
         tokio::spawn(async move {
             while let Some((_addr, reply)) = reply_rx.recv().await {
@@ -41,12 +31,26 @@ impl DummyPool {
             }
         });
 
-        Ok(DummyPool { task_txs })
+        Ok(pool)
+    }
+
+    async fn add_node(&mut self, addr: SocketAddr) -> Result<(), tungstenite::Error> {
+        let socket = TcpSocket::new_v4()?;
+        let tcp_stream = socket.connect(addr).await?;
+
+        let (ws_stream, _response) =
+            tokio_tungstenite::client_async(format!("ws://{addr}/"), tcp_stream).await?;
+
+        let (task_tx, task_rx) = unbounded_channel();
+        tokio::spawn(process(ws_stream, addr, self.reply_tx.clone(), task_rx));
+        self.task_txs.insert(addr, task_tx);
+
+        Ok(())
     }
 
     // Dummy random static assignment.
-    async fn load_balancing_algorithm(&self) -> Option<usize> {
-        let n = self.task_txs.lock().await.len();
+    fn load_balancing_algorithm(&self) -> Option<usize> {
+        let n = self.task_txs.len();
         if n == 0 {
             None
         } else {
@@ -54,36 +58,40 @@ impl DummyPool {
         }
     }
 
-    pub async fn schedule_task(&mut self, task_json: String) -> Option<()> {
-        if let Some(idx) = self.load_balancing_algorithm().await {
-            let mut task_txs = self.task_txs.lock().await;
-            let client_addr = *task_txs
+    /// Schedules a task. Returns `true` if the task was scheduled properly otherwise returns
+    /// `false` and the caller should call `schedule_task` again with the same task.
+    pub async fn schedule_task(&mut self, task_json: String) -> bool {
+        if let Some(idx) = self.load_balancing_algorithm() {
+            let client_addr = *self
+                .task_txs
                 .keys()
                 .nth(idx)
                 .expect("Index out of bounds while querying the task transmitters");
 
-            if let Some(sender) = task_txs.get(&client_addr) {
+            if let Some(sender) = self.task_txs.get(&client_addr) {
                 if let Err(e) = sender.send(task_json) {
                     println!("Failed to assign task to {client_addr}: {e}");
-                    task_txs.remove(&client_addr);
-                    return None;
+                    let _ = self.add_node(client_addr).await;
+                    return false;
                 }
             }
-
-            Some(())
-        } else {
-            None
         }
+        true
     }
 }
 
+/// Handle communication with a single node.
+/// 
+/// Any error on the channels or the websockets would cause the function to return early thereby
+/// dropping `task_rx` and causing the `UnboundedSender::send` in `DummyPool::schedule_task` to
+/// fail. This would in turn cause `DummyPool` to create a new websocket with the same address as
+/// the one that failed.
 async fn process(
-    tcp_stream: TcpStream,
+    ws_stream: WebSocketStream<TcpStream>,
     addr: SocketAddr,
     reply_tx: UnboundedSender<(SocketAddr, String)>,
     mut task_rx: UnboundedReceiver<String>,
 ) -> Result<(), tungstenite::Error> {
-    let ws_stream = tokio_tungstenite::accept_async(tcp_stream).await?;
     let (mut tx, mut rx) = ws_stream.split();
 
     // Handles sending tasks

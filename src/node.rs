@@ -1,30 +1,24 @@
-use crate::SERVER_PORT;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
-use std::{net::Ipv4Addr, time::Duration};
-use tokio::net::TcpSocket;
+use std::{net::SocketAddr, time::Duration};
+use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::{self, Message};
 
-struct DummyNode;
+struct DummyNode {
+    listener: TcpListener,
+}
 
 impl DummyNode {
-    fn new() -> DummyNode {
-        DummyNode
+    async fn new(addr: SocketAddr) -> Result<DummyNode, tungstenite::Error> {
+        let listener = TcpListener::bind(addr).await?;
+        Ok(DummyNode { listener })
     }
 
     async fn process_tasks_loop(&self) -> Result<(), tungstenite::Error> {
         // Handles disconnection by recreating the WebSocket with each call
         let (mut tx, mut rx) = {
-            let socket = TcpSocket::new_v4()?;
-            let tcp_stream = socket
-                .connect((Ipv4Addr::LOCALHOST, SERVER_PORT).into())
-                .await?;
-            let (ws_stream, _response) = tokio_tungstenite::client_async(
-                format!("ws://localhost:{SERVER_PORT}/"),
-                tcp_stream,
-            )
-            .await?;
-
+            let (tcp_stream, _addr) = self.listener.accept().await?;
+            let ws_stream = tokio_tungstenite::accept_async(tcp_stream).await?;
             ws_stream.split()
         };
 
@@ -44,6 +38,12 @@ impl DummyNode {
 
     async fn process_single_task(&self, task_json: &str) -> Result<String, tungstenite::Error> {
         if self.simulated_network_failure() {
+            println!(
+                "Simulated network failure at {}",
+                self.listener
+                    .local_addr()
+                    .expect("Failed to get address of listener")
+            );
             return Err(tungstenite::Error::ConnectionClosed);
         }
 
@@ -59,17 +59,18 @@ impl DummyNode {
     }
 
     fn simulated_network_failure(&self) -> bool {
-        // 10% chance of failure
-        rand::thread_rng().gen_range(0..100) < 10
+        // 5% chance of failure
+        rand::thread_rng().gen_range(0..100) < 5
     }
 }
 
-pub async fn client_loop_with_retry() {
-    let node = DummyNode::new();
+pub async fn client_loop_with_retry(addr: SocketAddr) {
+    let node = DummyNode::new(addr)
+        .await
+        .expect("Unable to create `DummyNode`");
     loop {
-        if let Err(e) = node.process_tasks_loop().await {
-            // Maybe log error then retry
-            println!("{e}");
+        if let Err(_e) = node.process_tasks_loop().await {
+            // Maybe log error
         }
     }
 }
